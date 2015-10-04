@@ -1,0 +1,272 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+import MySQLdb as mdb
+import sys
+#import nltk
+import pandas as pd
+from textstat.textstat import textstat
+import copy
+import numpy as np
+
+
+def read_in_mysql():
+    ''' reads metadata and reviews databases into dataframes.
+        Usage:  df_m, df_r = read_in_mysql()'''
+    
+    con = mdb.connect('localhost', 'insightUser', 'insight15', 'amazon_filtered_compact');
+    cur = con.cursor()
+    
+    cur.execute("SELECT * FROM reviews")
+    data = cur.fetchall()
+    
+    df_reviews = pd.DataFrame( [[ij for ij in i] for i in data] )
+    df_reviews.rename(columns={0: 'Number',
+                               1: 'asin', 
+                               2: 'helpful-1',
+                               3: 'helpful-2',
+                               4: 'overall_score',
+                               5: 'review_text',
+                               6: 'reviewer_id',
+                               7: 'review_summary'}, 
+                      inplace=True);
+    df_reviews.drop('Number',axis=1, inplace = True)
+    
+    cur.execute("SELECT * FROM metadata")
+    data = cur.fetchall()
+
+    df_metadata = pd.DataFrame( [[ij for ij in i] for i in data] )
+    df_metadata.rename(columns={0: 'Number',
+                                1: 'asin',
+                                2: 'title',
+                                3: 'imgUrl',
+                                4: 'relevant_asins',
+                                5: 'sales_rank'}, 
+                       inplace=True);
+
+    df_metadata.drop('Number',axis=1, inplace = True)
+
+    con.close()
+    
+    return df_metadata, df_reviews
+
+
+def find_difficulty(df):
+    '''  USAGE:   asin = '0005217954'
+    score, success, scores_count = find_difficulty(df_r[df_r.asin == '0005217954'])
+     given a reviews dataframe for a single book, 
+    returns an estimate for the difficulty of the book'''
+    default_score = 0
+    
+    revs = df.review_text
+    score = 0.
+    scores_count = 0
+    debug_failed_count = 0
+    
+    for rev in revs: 
+        # NB  OUT OF TEXTSTAT,  SMOG Index fails by definition, and so
+        
+        try:
+            #a number that approximates the grade level needed to comprehend the text.
+            score1 = textstat.automated_readability_index(rev)
+            score += score1
+            scores_count +=1
+        except: debug_failed_count +=1
+            
+        try: 
+            #flesch_reading_ease  https://en.wikipedia.org/wiki/Flesch%E2%80%93Kincaid_readability_tests
+            score2 = textstat.flesch_kincaid_grade(rev)
+            score += score2
+            scores_count +=1
+        except: debug_failed_count +=1
+            
+#         try:
+#             #Gunning fog - another grade estimate
+#             score3 = textstat.gunning_fog(rev)
+#             score += score2
+#             scores_count +=1
+#         except: debug_failed_count +=1
+            
+    if scores_count == 0: return default_score, False, 0 
+    return score/scores_count,  True, scores_count
+
+def find_related_asins_depth1(asin, dfm):
+    row = dfm[dfm.asin == asin]
+    
+    if row.empty: return set([])
+    for asins_str in row.relevant_asins: pass # TODO: find better way to access an object
+    asins = asins_str.split()
+    
+    asins_set = set([])
+    
+    for asin1 in asins: 
+        row1 = dfm[dfm.asin == asin1]
+        if not row1.empty: asins_set.add(asin1)
+    
+    return asins_set
+
+def find_related_asins(asin, dfm, depth):
+    ''' asins are related by amazon'z connections;
+        depth is how many layers in the network we go '''
+    try:
+        if depth == 0: return set([asin])
+
+        asins = find_related_asins_depth1(asin, dfm)
+        if depth == 1: return asins
+        asins_out = copy.deepcopy(asins)
+        for asin1 in asins:
+            asins_out.update(find_related_asins(asin1,dfm,depth-1))
+
+        return asins_out
+    except Exception as e:
+        print "failed in find_related_asins  ", e
+        return {}
+    
+def make_relevant_meta_df(asin,dfm,max_depth):
+    ''' creates a table of metadata with the fields prepared for the output
+        USAGE dfo = make_relevant_meta_df(asin0,df_m,max_depth0)'''
+
+    row = df_m[df_m.asin == asin] 
+
+    d = {'asin': str(row.asin.values[0]), 
+         'depth': 0, 
+         'title': str(row.title.values[0]), 
+         'imgUrl': str(row.imgUrl.values[0]),
+          #'is_dif_rated': False, 
+         'difficulty': 0, 
+         'similarity': 0}
+
+    list_of_dicts = [d]
+    covered_asins = [asin]
+    for depth in range(1,max_depth + 1):
+
+        asins = find_related_asins(asin, df_m, depth)
+        for asin1 in asins:
+            if asin1 in covered_asins: continue
+            covered_asins.append(asin1)
+            row = df_m[df_m.asin == asin1]
+            d = {'asin': str(row.asin.values[0]), 
+                 'depth': depth, 
+                 'title': str(row.title.values[0]), 
+                 'imgUrl': str(row.imgUrl.values[0]), 
+                  #'is_dif_rated': False, 
+                 'difficulty': 0, 
+                 'similarity': 0}
+            list_of_dicts.append(d)
+
+    return pd.DataFrame(list_of_dicts)
+
+def get_difficultied_dfs(asin, df_meta_relevant, df_reviews):
+    ''' sets difficulty scores for the relevant books
+        produces dataframes which we could and could not rate'''
+    # USAGE
+    # asin0 = '0521468000'
+    # max_depth0 = 2
+    # dfo = make_relevant_meta_df(asin0,df_m,max_depth0)
+    # dfrated, dfunrated = get_difficultied_dfs(asin0, dfo, df_r)
+
+    for asin in df_meta_relevant.asin.values:
+
+        dfr_asin = df_reviews[df_reviews.asin == asin]
+        score, success, scores_count = find_difficulty(dfr_asin)
+
+        indx = df_meta_relevant[df_meta_relevant.asin == asin].index
+
+        if success:
+            df_meta_relevant.loc[indx,'difficulty'] = score
+        else:
+            df_meta_relevant.loc[indx,'difficulty'] = -1
+
+    dfo_rated = df_meta_relevant[df_meta_relevant['difficulty'] > -1].sort('difficulty')
+    dfo_unrated = df_meta_relevant[df_meta_relevant['difficulty'] < 0]
+    
+    return dfo_rated, dfo_unrated
+
+
+def make_relevant_meta_df_manyasins(asins0,dfm,max_depth):
+    ''' creates a table of metadata with the fields prepared for the output
+        USAGE dfo = make_relevant_meta_df(asin0,df_m,max_depth0)'''
+
+    list_of_dicts = []
+    covered_asins = []
+    
+    for asin0 in asins0:
+        row = dfm[dfm.asin == asin0] 
+        d = {'asin': str(row.asin.values[0]), 
+             'depth': 0, 
+             'title': str(row.title.values[0]), 
+             'imgUrl': str(row.imgUrl.values[0]),
+              #'is_dif_rated': False, 
+             'difficulty': 0, 
+             'similarity': 0}
+        list_of_dicts.append(d)
+        covered_asins.append(asin0)
+
+    # TODO:  proper breadth-first below
+    for asin0 in asins0:    
+        for depth in range(1,max_depth + 1):
+
+            asins = find_related_asins(asin0, dfm, depth)
+            for asin1 in asins:
+                if asin1 in covered_asins: continue
+                covered_asins.append(asin1)
+                row = dfm[dfm.asin == asin1]
+                d = {'asin': str(row.asin.values[0]), 
+                     'depth': depth, 
+                     'title': str(row.title.values[0]), 
+                     'imgUrl': str(row.imgUrl.values[0]), 
+                      #'is_dif_rated': False, 
+                     'difficulty': 0, 
+                     'similarity': 0}
+                list_of_dicts.append(d)
+
+    return pd.DataFrame(list_of_dicts)
+
+# def make_plot(dfr):
+#     ''' USAGE  plot = dfplot.plot(kind='barh', figsize=(12, len(dfplot.index)/2))'''
+   
+#     df_for_plot = pd.DataFrame(dfr.values, index =asins_out.update(find_related_asins(asin1,dfm,depth-1)) dfrated.title, columns = ['difficulty'])
+    
+#     return df_for_plot.difficulty.plot(kind='barh', figsize=(12, len(df_for_plot.index)/2))
+def pipeline(title, max_depth):
+
+    # read in the main dataframes
+    df_m, df_r = read_in_mysql()
+
+    # find asins relevant to the title
+    # Future: include Lewenstein distance and lower()
+    df_onTitle = df_m[df_m.title == title]
+    asins0 = df_onTitle.asin.values
+
+    if asins0.size == 0: 
+         return ' ERROR : NO SUCH TITLE'  # ----------- edit here
+
+    # PRINTOUT RELEVANT TITLES, ASINS -- LATER INCLUDE IMAGES AND BUTTONS
+    print " -------- FOUND BOOKS ---------"
+    for asin0 in asins0:
+        print title, "   ", asin0
+    print
+
+    dfo = make_relevant_meta_df_manyasins(asins0,df_m,max_depth)
+
+    dfrated, dfunrated = get_difficultied_dfs(asin0, dfo, df_r)
+
+    dfplot = pd.DataFrame(dfrated.difficulty.values, index = dfrated.title)
+
+    plot = dfplot.plot(kind='barh', 
+                       figsize=(12, len(dfplot.index)/2),
+                       color=(1,0.5,0))
+    plot.set_xlabel("GUESSED DIFFICULTY")
+    
+    return plot
+
+
+title = 'Classical Mechanics'
+max_depth = 1
+
+plot = pipeline(title, max_depth)
+
+plot.figure.set_size_inches(13,5)
+plot.figure.subplots_adjust(left = 0.88)
+plot.figure.subplots_adjust(right = 0.95)
+plot.figure.savefig('diff_fig.jpg')
